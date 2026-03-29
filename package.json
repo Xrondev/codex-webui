@@ -1,0 +1,40 @@
+{
+  "name": "codex-webui",
+  "version": "1.0.0",
+  "description": "A minimal Codex Web UI that wraps the local Codex CLI.",
+  "private": true,
+  "scripts": {
+    "dev": "NODE_ENV=development tsx watch server/index.ts",
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "start": "NODE_ENV=production node dist-server/index.js"
+  },
+  "keywords": [
+    "codex",
+    "webui",
+    "terminal"
+  ],
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.2.1",
+    "node-pty": "^1.1.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "ws": "^8.20.0",
+    "xterm": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^6.0.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.3"
+  }
+}
