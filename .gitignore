@@ -4,3 +4,6 @@ dist-server/
 .npm-cache/
 .run/*.pid
 .run/logs/
+.env
+.env.*
+*.local

@@ -1,7 +1,7 @@
 import cookieParser from "cookie-parser";
 import express, { Request, Response } from "express";
 import { randomUUID } from "node:crypto";
-import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { ChildProcessWithoutNullStreams, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,32 +9,31 @@ import { fileURLToPath } from "node:url";
 import http from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import type { ViteDevServer } from "vite";
-import { IPty, spawn as spawnPty } from "node-pty";
+import { spawn as spawnPty } from "node-pty";
 
 type ClientMessage =
   | { type: "input"; data: string }
   | { type: "resize"; cols: number; rows: number }
   | { type: "ping" };
 
-type ServerMessage =
-  | { type: "snapshot"; data: string; workspace: string; running: boolean }
-  | { type: "output"; data: string }
-  | { type: "exit"; exitCode: number; signal?: number }
-  | { type: "error"; message: string }
-  | { type: "status"; running: boolean; workspace?: string };
-
-type Session = {
-  token: string;
-  workspace?: string;
-  terminal?: {
-    kill(signal?: string): void;
-    resize(cols: number, rows: number): void;
-    write(data: string): void;
-  };
-  output: string;
+type CodexSessionSummary = {
+  id: string;
+  label: string;
+  workspace: string;
+  tmuxSession: string;
   running: boolean;
-  clients: Set<WebSocket>;
+  createdAt: number;
+  lastActivity: number;
+  attachedClients: number;
+  preview: string;
 };
+
+type ServerMessage =
+  | { type: "snapshot"; data: string; session: CodexSessionSummary }
+  | { type: "output"; data: string; sessionId: string }
+  | { type: "exit"; exitCode: number; signal?: number; sessionId: string }
+  | { type: "status"; sessionId: string; session: CodexSessionSummary | null }
+  | { type: "error"; message: string; sessionId?: string };
 
 type ProviderConfigSummary = {
   modelProvider: string;
@@ -50,6 +49,23 @@ type RuntimeConfig = {
   port: number;
 };
 
+type AuthSession = {
+  token: string;
+  createdAt: number;
+};
+
+type TerminalBridge = {
+  kill(signal?: string): void;
+  resize(cols: number, rows: number): void;
+  write(data: string): void;
+};
+
+type SessionLookup = {
+  sessions: CodexSessionSummary[];
+  tmuxAvailable: boolean;
+  tmuxError?: string;
+};
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
@@ -57,12 +73,13 @@ const distDir = path.resolve(rootDir, "dist");
 const ptyBridgePath = path.resolve(rootDir, "server", "pty_bridge.py");
 const homeDir = os.homedir();
 const sessionCookieName = "codex_webui_session";
-const maxBufferSize = 2_000_000;
 const sandboxRestricted = Boolean(process.env.CODEX_SANDBOX);
 const restrictionMessage = sandboxRestricted
   ? "This Web UI server was started inside a Codex sandbox, so it cannot launch nested Codex sessions. Start the server from your own terminal instead."
   : undefined;
 const codexConfigPath = path.join(homeDir, ".codex", "config.toml");
+const tmuxSessionPrefix = "codex-webui";
+const tmuxMetadataPrefix = "@codex_webui";
 
 function readArgValue(argv: string[], index: number) {
   const current = argv[index] ?? "";
@@ -154,8 +171,7 @@ const runtimeConfig = parseRuntimeConfig(process.argv.slice(2));
 const defaultPassword = runtimeConfig.defaultPassword;
 const port = runtimeConfig.port;
 const defaultWorkspace = runtimeConfig.defaultWorkspace;
-
-const sessions = new Map<string, Session>();
+const authSessions = new Map<string, AuthSession>();
 
 const app = express();
 const server = http.createServer(app);
@@ -214,50 +230,6 @@ function readProviderSummary(): ProviderConfigSummary {
   };
 }
 
-function getOrCreateSession(token: string): Session {
-  const existing = sessions.get(token);
-  if (existing) {
-    return existing;
-  }
-
-  const session: Session = {
-    token,
-    workspace: defaultWorkspace,
-    output: "",
-    running: false,
-    clients: new Set(),
-  };
-  sessions.set(token, session);
-  return session;
-}
-
-function appendOutput(session: Session, chunk: string) {
-  session.output += chunk;
-  if (session.output.length > maxBufferSize) {
-    session.output = session.output.slice(session.output.length - maxBufferSize);
-  }
-}
-
-function sendJson(socket: WebSocket, payload: ServerMessage) {
-  if (socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(payload));
-  }
-}
-
-function broadcast(session: Session, payload: ServerMessage) {
-  for (const client of session.clients) {
-    sendJson(client, payload);
-  }
-}
-
-function killSession(session: Session) {
-  if (session.terminal) {
-    session.terminal.kill("SIGTERM");
-    session.terminal = undefined;
-  }
-  session.running = false;
-}
-
 function createCookieOptions() {
   return {
     httpOnly: true,
@@ -273,7 +245,7 @@ function parseSessionToken(req: Request): string | undefined {
 
 function authRequired(req: Request, res: Response, next: () => void) {
   const token = parseSessionToken(req);
-  if (!token || !sessions.has(token)) {
+  if (!token || !authSessions.has(token)) {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
@@ -311,11 +283,41 @@ function listDirectories(targetPath?: string) {
 
   const entries = fs
     .readdirSync(resolved, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => ({
-      name: entry.name,
-      path: path.join(resolved, entry.name),
-    }))
+    .flatMap((entry) => {
+      const entryPath = path.join(resolved, entry.name);
+
+      if (entry.isDirectory()) {
+        return [
+          {
+            name: entry.name,
+            path: entryPath,
+            isSymlink: false,
+          },
+        ];
+      }
+
+      if (!entry.isSymbolicLink()) {
+        return [];
+      }
+
+      try {
+        const targetStat = fs.statSync(entryPath);
+        if (!targetStat.isDirectory()) {
+          return [];
+        }
+
+        return [
+          {
+            name: entry.name,
+            path: entryPath,
+            isSymlink: true,
+            targetPath: fs.realpathSync(entryPath),
+          },
+        ];
+      } catch {
+        return [];
+      }
+    })
     .sort((a, b) => a.name.localeCompare(b.name));
 
   return {
@@ -326,15 +328,8 @@ function listDirectories(targetPath?: string) {
 }
 
 function buildCodexChildEnv() {
-  const filteredEntries = Object.entries(process.env).filter(([key]) => {
-    if (key.startsWith("CODEX_")) {
-      return false;
-    }
-
-    return true;
-  });
-
-  const env = Object.fromEntries(filteredEntries);
+  const filteredEntries = Object.entries(process.env).filter(([key]) => !key.startsWith("CODEX_"));
+  const env = Object.fromEntries(filteredEntries) as NodeJS.ProcessEnv;
   const pathEntries = String(env.PATH ?? "")
     .split(path.delimiter)
     .filter(Boolean)
@@ -345,65 +340,282 @@ function buildCodexChildEnv() {
     PATH: pathEntries.join(path.delimiter),
     TERM: "xterm-256color",
     COLORTERM: "truecolor",
-    COLUMNS: "120",
-    LINES: "30",
+    TMUX: "",
   };
 }
 
-function attachChildProcess(session: Session, terminal: ChildProcessWithoutNullStreams, fallbackMessage?: string) {
-  session.terminal = {
-    kill(signal?: string) {
-      terminal.kill((signal as NodeJS.Signals | number | undefined) ?? "SIGTERM");
-    },
-    resize() {},
-    write(data: string) {
-      terminal.stdin.write(data);
-    },
-  };
-  session.running = true;
+function sanitizeSessionLabel(input: string) {
+  return input.trim().replace(/\s+/g, " ").slice(0, 64);
+}
 
-  if (fallbackMessage) {
-    appendOutput(session, fallbackMessage);
+function slugify(input: string) {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24);
+}
+
+function shellEscape(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function runCommand(command: string, args: string[], env?: NodeJS.ProcessEnv) {
+  return spawnSync(command, args, {
+    encoding: "utf8",
+    env,
+  });
+}
+
+function runTmux(args: string[], options?: { allowFailure?: boolean; env?: NodeJS.ProcessEnv }) {
+  const result = runCommand("tmux", args, options?.env);
+  const stderr = result.stderr?.trim() ?? "";
+
+  if (result.error) {
+    const error = result.error as NodeJS.ErrnoException;
+    if (options?.allowFailure) {
+      return "";
+    }
+
+    if (error.code === "ENOENT") {
+      throw new Error("tmux is required but was not found on PATH");
+    }
+
+    throw error;
   }
 
-  terminal.stdout.on("data", (chunk: Buffer) => {
-    const text = chunk.toString("utf8");
-    appendOutput(session, text);
-    broadcast(session, { type: "output", data: text });
+  if (result.status !== 0) {
+    if (options?.allowFailure) {
+      return "";
+    }
+
+    throw new Error(stderr || `tmux ${args[0]} failed`);
+  }
+
+  return result.stdout?.trimEnd() ?? "";
+}
+
+function isTmuxUnavailable(error: unknown) {
+  return error instanceof Error && error.message.includes("tmux is required");
+}
+
+function coerceTmuxTimestamp(value: string) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return Date.now();
+  }
+
+  return parsed < 1_000_000_000_000 ? parsed * 1000 : parsed;
+}
+
+function buildSessionPreview(tmuxSession: string) {
+  try {
+    const output = runTmux(["capture-pane", "-p", "-J", "-S", "-12", "-t", tmuxSession], {
+      allowFailure: true,
+    });
+    return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-3)
+      .join(" ")
+      .slice(0, 240);
+  } catch {
+    return "";
+  }
+}
+
+function parseCodexSessionLine(line: string): CodexSessionSummary | null {
+  const parts = line.split("\t");
+  if (parts.length < 9) {
+    return null;
+  }
+
+  const [tmuxSession, managedFlag, sessionId, labelValue, storedWorkspace, fallbackWorkspace, createdAt, lastActivity, attachedClients] = parts;
+  const managed = managedFlag === "1" || tmuxSession.startsWith(`${tmuxSessionPrefix}-`);
+
+  if (!managed || !sessionId) {
+    return null;
+  }
+
+  const workspace = storedWorkspace || fallbackWorkspace || defaultWorkspace;
+  const label = labelValue || path.basename(workspace) || tmuxSession;
+
+  return {
+    id: sessionId,
+    label,
+    workspace,
+    tmuxSession,
+    running: true,
+    createdAt: coerceTmuxTimestamp(createdAt),
+    lastActivity: coerceTmuxTimestamp(lastActivity),
+    attachedClients: Number(attachedClients || "0") || 0,
+    preview: buildSessionPreview(tmuxSession),
+  };
+}
+
+function listCodexSessions(): CodexSessionSummary[] {
+  const format = [
+    "#{session_name}",
+    `#{${tmuxMetadataPrefix}_managed}`,
+    `#{${tmuxMetadataPrefix}_id}`,
+    `#{${tmuxMetadataPrefix}_label}`,
+    `#{${tmuxMetadataPrefix}_workspace}`,
+    "#{pane_current_path}",
+    "#{session_created}",
+    "#{session_activity}",
+    "#{session_attached}",
+  ].join("\t");
+
+  const result = runCommand("tmux", ["list-sessions", "-F", format]);
+  const stderr = result.stderr?.trim() ?? "";
+
+  if (result.error) {
+    const error = result.error as NodeJS.ErrnoException;
+    if (error.code === "ENOENT") {
+      throw new Error("tmux is required but was not found on PATH");
+    }
+    throw error;
+  }
+
+  if (result.status !== 0) {
+    if (stderr.includes("failed to connect to server") || stderr.includes("no server running")) {
+      return [];
+    }
+    throw new Error(stderr || "Unable to list tmux sessions");
+  }
+
+  return (result.stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map(parseCodexSessionLine)
+    .filter((session): session is CodexSessionSummary => Boolean(session))
+    .sort((left, right) => right.lastActivity - left.lastActivity);
+}
+
+function getSessionLookup(): SessionLookup {
+  try {
+    return {
+      sessions: listCodexSessions(),
+      tmuxAvailable: true,
+    };
+  } catch (error) {
+    return {
+      sessions: [],
+      tmuxAvailable: false,
+      tmuxError: error instanceof Error ? error.message : "Unable to query tmux sessions",
+    };
+  }
+}
+
+function findCodexSession(sessionId: string) {
+  return listCodexSessions().find((session) => session.id === sessionId) ?? null;
+}
+
+function buildTmuxSessionName(sessionId: string, label: string, workspace: string) {
+  const baseName = slugify(label || path.basename(workspace) || "session") || "session";
+  return `${tmuxSessionPrefix}-${baseName}-${sessionId.slice(0, 8)}`;
+}
+
+function setManagedTmuxOptions(tmuxSession: string, sessionId: string, label: string, workspace: string) {
+  runTmux(["set-option", "-t", tmuxSession, "-q", "status", "off"]);
+  runTmux(["set-option", "-t", tmuxSession, "-q", "window-size", "latest"]);
+  runTmux(["set-option", "-t", tmuxSession, "-q", "mouse", "on"]);
+  runTmux(["set-option", "-t", tmuxSession, "-q", "history-limit", "50000"]);
+  runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_managed`, "1"]);
+  runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_id`, sessionId]);
+  runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_label`, label]);
+  runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_workspace`, workspace]);
+}
+
+function buildCodexLaunchCommand(workspace: string) {
+  return `${shellEscape(codexCommand)} --no-alt-screen -C ${shellEscape(workspace)}`;
+}
+
+function createCodexSession(workspaceInput: string, labelInput: string) {
+  if (sandboxRestricted) {
+    throw new Error(restrictionMessage);
+  }
+
+  const workspace = normalizeDirectory(workspaceInput);
+  const stat = fs.statSync(workspace);
+  if (!stat.isDirectory()) {
+    throw new Error("Workspace is not a directory");
+  }
+
+  const label = sanitizeSessionLabel(labelInput) || path.basename(workspace) || "Codex session";
+  const sessionId = randomUUID();
+  const tmuxSession = buildTmuxSessionName(sessionId, label, workspace);
+  const childEnv = buildCodexChildEnv();
+  const command = buildCodexLaunchCommand(workspace);
+  const result = runCommand("tmux", ["new-session", "-d", "-s", tmuxSession, "-c", workspace, command], childEnv);
+
+  if (result.error) {
+    const error = result.error as NodeJS.ErrnoException;
+    if (error.code === "ENOENT") {
+      throw new Error("tmux is required but was not found on PATH");
+    }
+    throw error;
+  }
+
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.trim() || "Unable to create tmux session");
+  }
+
+  setManagedTmuxOptions(tmuxSession, sessionId, label, workspace);
+  const session = findCodexSession(sessionId);
+  if (!session) {
+    throw new Error("Session started but could not be discovered in tmux");
+  }
+
+  return session;
+}
+
+function killCodexSession(sessionId: string) {
+  const session = findCodexSession(sessionId);
+  if (!session) {
+    throw new Error("Session not found");
+  }
+
+  runTmux(["kill-session", "-t", session.tmuxSession]);
+}
+
+function sendJson(socket: WebSocket, payload: ServerMessage) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(payload));
+  }
+}
+
+function createNodePtyAttachment(socket: WebSocket, session: CodexSessionSummary): TerminalBridge {
+  const terminal = spawnPty("tmux", ["attach-session", "-t", session.tmuxSession], {
+    cwd: session.workspace,
+    env: buildCodexChildEnv(),
+    name: "xterm-256color",
+    cols: 120,
+    rows: 30,
   });
 
-  terminal.stderr.on("data", (chunk: Buffer) => {
-    const text = chunk.toString("utf8");
-    appendOutput(session, text);
-    broadcast(session, { type: "output", data: text });
+  terminal.onData((text: string) => {
+    sendJson(socket, { type: "output", data: text, sessionId: session.id });
   });
 
-  terminal.on("exit", (exitCode, signal) => {
-    session.running = false;
-    session.terminal = undefined;
-    broadcast(session, {
+  terminal.onExit(({ exitCode, signal }) => {
+    const latest = findCodexSession(session.id);
+    sendJson(socket, {
       type: "exit",
       exitCode: exitCode ?? 0,
       signal: typeof signal === "number" ? signal : undefined,
+      sessionId: session.id,
     });
-    broadcast(session, {
+    sendJson(socket, {
       type: "status",
-      running: false,
-      workspace: session.workspace,
+      sessionId: session.id,
+      session: latest,
     });
   });
 
-  terminal.on("error", (error) => {
-    const text = `Failed to start terminal process: ${error.message}\n`;
-    appendOutput(session, text);
-    broadcast(session, { type: "output", data: text });
-    session.running = false;
-    session.terminal = undefined;
-  });
-}
-
-function attachNodePty(session: Session, terminal: IPty) {
-  session.terminal = {
+  return {
     kill(signal?: string) {
       terminal.kill(signal);
     },
@@ -414,67 +626,64 @@ function attachNodePty(session: Session, terminal: IPty) {
       terminal.write(data);
     },
   };
-  session.running = true;
+}
 
-  terminal.onData((text: string) => {
-    appendOutput(session, text);
-    broadcast(session, { type: "output", data: text });
+function createBridgeAttachment(socket: WebSocket, session: CodexSessionSummary): TerminalBridge {
+  const terminal = spawn("python3", [ptyBridgePath, "tmux", "attach-session", "-t", session.tmuxSession], {
+    cwd: session.workspace,
+    env: buildCodexChildEnv(),
   });
 
-  terminal.onExit(({ exitCode, signal }) => {
-    session.running = false;
-    session.terminal = undefined;
-    broadcast(session, {
+  terminal.stdout.on("data", (chunk: Buffer) => {
+    sendJson(socket, { type: "output", data: chunk.toString("utf8"), sessionId: session.id });
+  });
+
+  terminal.stderr.on("data", (chunk: Buffer) => {
+    sendJson(socket, { type: "output", data: chunk.toString("utf8"), sessionId: session.id });
+  });
+
+  terminal.on("exit", (exitCode, signal) => {
+    const latest = findCodexSession(session.id);
+    sendJson(socket, {
       type: "exit",
       exitCode: exitCode ?? 0,
       signal: typeof signal === "number" ? signal : undefined,
+      sessionId: session.id,
     });
-    broadcast(session, {
+    sendJson(socket, {
       type: "status",
-      running: false,
-      workspace: session.workspace,
+      sessionId: session.id,
+      session: latest,
     });
   });
+
+  terminal.on("error", (error) => {
+    sendJson(socket, {
+      type: "error",
+      message: error.message,
+      sessionId: session.id,
+    });
+  });
+
+  return {
+    kill(signal?: string) {
+      terminal.kill((signal as NodeJS.Signals | number | undefined) ?? "SIGTERM");
+    },
+    resize() {},
+    write(data: string) {
+      terminal.stdin.write(data);
+    },
+  };
 }
 
-function startCodex(session: Session, workspace: string) {
-  if (sandboxRestricted) {
-    throw new Error(restrictionMessage);
-  }
-
-  killSession(session);
-
-  const resolvedWorkspace = normalizeDirectory(workspace);
-  const stat = fs.statSync(resolvedWorkspace);
-  if (!stat.isDirectory()) {
-    throw new Error("Workspace is not a directory");
-  }
-
-  session.output = "";
-  session.workspace = resolvedWorkspace;
-  const childEnv = buildCodexChildEnv();
-
+function createTmuxAttachment(socket: WebSocket, session: CodexSessionSummary) {
   try {
-    const terminal = spawnPty(codexCommand, ["--no-alt-screen", "-C", resolvedWorkspace], {
-      cwd: resolvedWorkspace,
-      env: childEnv,
-      name: "xterm-256color",
-      cols: 120,
-      rows: 30,
-    });
-    attachNodePty(session, terminal);
-    return;
+    return createNodePtyAttachment(socket, session);
   } catch (error) {
-    const fallbackMessage = `node-pty unavailable, falling back to python bridge: ${error instanceof Error ? error.message : "unknown error"}\n`;
-    const terminal = spawn(
-      "python3",
-      [ptyBridgePath, codexCommand, "--no-alt-screen", "-C", resolvedWorkspace],
-      {
-        cwd: resolvedWorkspace,
-        env: childEnv,
-      },
-    );
-    attachChildProcess(session, terminal, fallbackMessage);
+    if (isTmuxUnavailable(error)) {
+      throw error;
+    }
+    return createBridgeAttachment(socket, session);
   }
 }
 
@@ -497,6 +706,7 @@ function parseCookies(header?: string): Record<string, string> {
 
 app.get("/api/health", (_req, res) => {
   const provider = readProviderSummary();
+  const lookup = getSessionLookup();
   res.json({
     ok: true,
     codexCommand,
@@ -505,6 +715,9 @@ app.get("/api/health", (_req, res) => {
     sandboxRestricted,
     restrictionMessage,
     provider,
+    tmuxAvailable: lookup.tmuxAvailable,
+    tmuxError: lookup.tmuxError,
+    sessions: lookup.sessions,
   });
 });
 
@@ -516,7 +729,10 @@ app.post("/api/auth/login", (req, res) => {
   }
 
   const token = randomUUID();
-  getOrCreateSession(token);
+  authSessions.set(token, {
+    token,
+    createdAt: Date.now(),
+  });
   res.cookie(sessionCookieName, token, createCookieOptions());
   res.json({ ok: true, token });
 });
@@ -524,11 +740,7 @@ app.post("/api/auth/login", (req, res) => {
 app.post("/api/auth/logout", authRequired, (req, res) => {
   const token = parseSessionToken(req);
   if (token) {
-    const session = sessions.get(token);
-    if (session) {
-      killSession(session);
-      sessions.delete(token);
-    }
+    authSessions.delete(token);
   }
 
   res.clearCookie(sessionCookieName, createCookieOptions());
@@ -537,22 +749,23 @@ app.post("/api/auth/logout", authRequired, (req, res) => {
 
 app.get("/api/auth/session", (req, res) => {
   const token = parseSessionToken(req);
-  if (!token || !sessions.has(token)) {
-    res.status(401).json({ authenticated: false });
+  if (!token || !authSessions.has(token)) {
+    res.status(401).json({ authenticated: false, sessions: [] });
     return;
   }
 
-  const session = getOrCreateSession(token);
   const provider = readProviderSummary();
+  const lookup = getSessionLookup();
   res.json({
     authenticated: true,
     token,
-    running: session.running,
-    workspace: session.workspace,
     homeDir,
     sandboxRestricted,
     restrictionMessage,
     provider,
+    tmuxAvailable: lookup.tmuxAvailable,
+    tmuxError: lookup.tmuxError,
+    sessions: lookup.sessions,
   });
 });
 
@@ -567,58 +780,41 @@ app.get("/api/fs/list", authRequired, (req, res) => {
   }
 });
 
-app.post("/api/codex/start", authRequired, (req, res) => {
-  const token = parseSessionToken(req);
-  if (!token) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
+app.get("/api/codex/sessions", authRequired, (_req, res) => {
+  const lookup = getSessionLookup();
+  res.json(lookup);
+});
 
-  const workspace = String(req.body?.workspace ?? "");
-  if (!workspace) {
-    res.status(400).json({ error: "Workspace is required" });
-    return;
-  }
-
+app.post("/api/codex/sessions", authRequired, (req, res) => {
   try {
-    const session = getOrCreateSession(token);
-    startCodex(session, workspace);
+    const workspace = String(req.body?.workspace ?? "");
+    if (!workspace.trim()) {
+      res.status(400).json({ error: "Workspace is required" });
+      return;
+    }
+
+    const label = String(req.body?.label ?? "");
+    const session = createCodexSession(workspace, label);
     res.json({
       ok: true,
-      workspace: session.workspace,
-      running: true,
+      session,
     });
   } catch (error) {
     res.status(400).json({
-      error: error instanceof Error ? error.message : "Unable to start Codex",
+      error: error instanceof Error ? error.message : "Unable to create Codex session",
     });
   }
 });
 
-app.post("/api/codex/stop", authRequired, (req, res) => {
-  const token = parseSessionToken(req);
-  if (!token) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
+app.delete("/api/codex/sessions/:sessionId", authRequired, (req, res) => {
+  try {
+    killCodexSession(String(req.params.sessionId ?? ""));
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(404).json({
+      error: error instanceof Error ? error.message : "Unable to stop Codex session",
+    });
   }
-
-  const session = getOrCreateSession(token);
-  killSession(session);
-  res.json({ ok: true });
-});
-
-app.get("/api/codex/status", authRequired, (req, res) => {
-  const token = parseSessionToken(req);
-  if (!token) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-
-  const session = getOrCreateSession(token);
-  res.json({
-    running: session.running,
-    workspace: session.workspace,
-  });
 });
 
 async function configureFrontend() {
@@ -665,57 +861,76 @@ server.on("upgrade", (request, socket, head) => {
 
   const cookies = parseCookies(request.headers.cookie);
   const token = requestUrl.searchParams.get("token") ?? cookies[sessionCookieName];
-  if (!token || !sessions.has(token)) {
+  const sessionId = requestUrl.searchParams.get("sessionId");
+
+  if (!token || !authSessions.has(token) || !sessionId) {
+    socket.destroy();
+    return;
+  }
+
+  const session = findCodexSession(sessionId);
+  if (!session) {
     socket.destroy();
     return;
   }
 
   wsServer.handleUpgrade(request, socket, head, (ws) => {
-    wsServer.emit("connection", ws, request, token);
+    wsServer.emit("connection", ws, request, session);
   });
 });
 
-wsServer.on("connection", (socket: WebSocket, _request: http.IncomingMessage, token: string) => {
-  const session = getOrCreateSession(token);
-  session.clients.add(socket);
-
+wsServer.on("connection", (socket: WebSocket, _request: http.IncomingMessage, session: CodexSessionSummary) => {
   sendJson(socket, {
     type: "snapshot",
-    data: session.output,
-    workspace: session.workspace ?? "",
-    running: session.running,
+    data: "",
+    session,
   });
+
+  let attachment: TerminalBridge;
+
+  try {
+    attachment = createTmuxAttachment(socket, session);
+  } catch (error) {
+    sendJson(socket, {
+      type: "error",
+      message: error instanceof Error ? error.message : "Unable to attach to tmux session",
+      sessionId: session.id,
+    });
+    socket.close();
+    return;
+  }
 
   socket.on("message", (raw: Buffer) => {
     try {
       const message = JSON.parse(String(raw)) as ClientMessage;
-      if (message.type === "input" && session.terminal) {
-        session.terminal.write(message.data);
+      if (message.type === "input") {
+        attachment.write(message.data);
         return;
       }
 
-      if (message.type === "resize" && session.terminal) {
-        session.terminal.resize(message.cols, message.rows);
+      if (message.type === "resize") {
+        attachment.resize(message.cols, message.rows);
         return;
       }
 
       if (message.type === "ping") {
         sendJson(socket, {
           type: "status",
-          running: session.running,
-          workspace: session.workspace,
+          sessionId: session.id,
+          session: findCodexSession(session.id),
         });
       }
     } catch (error) {
       sendJson(socket, {
         type: "error",
         message: error instanceof Error ? error.message : "Invalid websocket payload",
+        sessionId: session.id,
       });
     }
   });
 
   socket.on("close", () => {
-    session.clients.delete(socket);
+    attachment.kill("SIGTERM");
   });
 });
 

@@ -1,24 +1,53 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 
 set -euo pipefail
-setopt typeset_silent
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
 LOG_DIR="$RUN_DIR/logs"
-DEV_PID_FILE="$RUN_DIR/dev.pid"
-PROD_PID_FILE="$RUN_DIR/prod.pid"
-DEFAULT_PASSWORD="${WEBUI_PASSWORD:-password01}"
-DEV_PORTS=(3001)
-PROD_PORTS=(3001)
+PID_FILE="$RUN_DIR/webui.pid"
+SERVICE_ENV_FILE="${WEBUI_ENV_FILE:-$HOME/.config/codex-webui/codex-webui.env}"
+
+if [[ -f "$SERVICE_ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$SERVICE_ENV_FILE"
+  set +a
+fi
+
+PORT_VALUE="${PORT:-3001}"
+PASSWORD_VALUE="${WEBUI_PASSWORD:-}"
+NPM_BIN_VALUE="${NPM_BIN:-$(command -v npm || true)}"
 
 mkdir -p "$LOG_DIR"
 
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/webui.sh run
+  ./scripts/webui.sh start
+  ./scripts/webui.sh stop
+  ./scripts/webui.sh restart
+  ./scripts/webui.sh status
+
+Commands:
+  run       Run the production server in the foreground. Used by systemd.
+  start     Start the production server in the background.
+  stop      Stop the running background server.
+  restart   Restart the background server.
+  status    Show current pid and port status.
+
+Environment:
+  WEBUI_PASSWORD   Login password. Required unless already stored in ~/.config/codex-webui/codex-webui.env
+  WEBUI_WORKSPACE  Default workspace path shown in the UI
+  PORT             HTTP port to bind. Default: 3001
+  CODEX_BIN        Explicit path to the codex executable
+  WEBUI_ENV_FILE   Optional alternate env file path for local secrets
+EOF
+}
+
 cleanup_pid_file() {
-  local pid_file="$1"
-  if [[ -f "$pid_file" ]]; then
-    rm -f "$pid_file"
-  fi
+  rm -f "$PID_FILE"
 }
 
 detect_model_provider() {
@@ -36,37 +65,30 @@ ensure_provider_env() {
   provider="$(detect_model_provider)"
 
   if [[ "$provider" == "litellm" ]] && [[ -z "${LITELLM_API_KEY:-}" ]]; then
-    echo "LITELLM_API_KEY is missing, but ~/.codex/config.toml is configured with model_provider = \"litellm\"." >&2
-    echo "Run: export LITELLM_API_KEY=your_key" >&2
+    echo "LITELLM_API_KEY is missing, but ~/.codex/config.toml uses model_provider = \"litellm\"." >&2
+    echo "Set it in the environment or in $SERVICE_ENV_FILE." >&2
     exit 1
   fi
 }
 
-usage() {
-  cat <<'EOF'
-Usage:
-  ./scripts/webui.sh start [dev|prod]
-  ./scripts/webui.sh stop [dev|prod|all]
-  ./scripts/webui.sh restart [dev|prod]
-  ./scripts/webui.sh status
-
-Environment:
-  WEBUI_PASSWORD   Password used when starting the service. Default: password01
-  WEBUI_WORKSPACE  Default workspace path used when the UI opens
-  PORT             HTTP port to bind. Default: 3001
-  CODEX_BIN        Explicit path to codex executable
-EOF
+ensure_runtime_env() {
+  if [[ -z "$PASSWORD_VALUE" ]]; then
+    echo "WEBUI_PASSWORD is required." >&2
+    echo "Set it in the environment or in $SERVICE_ENV_FILE." >&2
+    exit 1
+  fi
 }
 
-pid_file_for_mode() {
-  case "${1:-dev}" in
-    dev) echo "$DEV_PID_FILE" ;;
-    prod) echo "$PROD_PID_FILE" ;;
-    *)
-      echo "Unsupported mode: $1" >&2
-      exit 1
-      ;;
-  esac
+ensure_build_ready() {
+  if [[ ! -f "$ROOT_DIR/dist-server/index.js" ]] || [[ ! -f "$ROOT_DIR/dist/index.html" ]]; then
+    echo "Production build is missing. Run ./scripts/install.sh or npm run build first." >&2
+    exit 1
+  fi
+
+  if [[ -z "$NPM_BIN_VALUE" ]]; then
+    echo "npm was not found on PATH. Set NPM_BIN=/absolute/path/to/npm if needed." >&2
+    exit 1
+  fi
 }
 
 kill_pid_if_running() {
@@ -80,160 +102,111 @@ kill_pid_if_running() {
   fi
 }
 
-kill_ports() {
-  local mode="${1:-all}"
-  local -a ports
-
-  case "$mode" in
-    dev) ports=("${DEV_PORTS[@]}") ;;
-    prod) ports=("${PROD_PORTS[@]}") ;;
-    all) ports=("${DEV_PORTS[@]}") ;;
-    *)
-      echo "Unsupported mode: $mode" >&2
-      exit 1
-      ;;
-  esac
-
-  for port in "${ports[@]}"; do
-    local pids
-    pids=$(lsof -tiTCP:"$port" -sTCP:LISTEN -n -P 2>/dev/null || true)
-    if [[ -n "$pids" ]]; then
-      echo "$pids" | while read -r pid; do
-        [[ -z "$pid" ]] && continue
-        kill_pid_if_running "$pid"
-      done
-    fi
-  done
-}
-
-stop_mode() {
-  local mode="${1:-all}"
-
-  if [[ "$mode" == "all" ]]; then
-    stop_mode dev
-    stop_mode prod
-    return
+stop_service() {
+  if [[ -f "$PID_FILE" ]]; then
+    kill_pid_if_running "$(cat "$PID_FILE")"
   fi
 
-  local pid_file
-  pid_file="$(pid_file_for_mode "$mode")"
-  if [[ -f "$pid_file" ]]; then
-    local pid
-    pid="$(cat "$pid_file")"
-    kill_pid_if_running "$pid"
+  cleanup_pid_file
+
+  local pids
+  pids=$(lsof -tiTCP:"$PORT_VALUE" -sTCP:LISTEN -n -P 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    while read -r pid; do
+      [[ -z "$pid" ]] && continue
+      kill_pid_if_running "$pid"
+    done <<< "$pids"
   fi
 
-  cleanup_pid_file "$pid_file"
-
-  kill_ports "$mode"
-  echo "Stopped $mode service."
+  echo "Stopped production service."
 }
 
-start_mode() {
-  local mode="${1:-dev}"
-  local pid_file
-  pid_file="$(pid_file_for_mode "$mode")"
+run_foreground() {
+  cd "$ROOT_DIR"
+  ensure_runtime_env
+  ensure_provider_env
+  ensure_build_ready
+  exec env \
+    WEBUI_PASSWORD="$PASSWORD_VALUE" \
+    WEBUI_WORKSPACE="${WEBUI_WORKSPACE:-}" \
+    PORT="$PORT_VALUE" \
+    CODEX_BIN="${CODEX_BIN:-}" \
+    "$NPM_BIN_VALUE" start
+}
 
-  stop_mode "$mode" >/dev/null 2>&1 || true
+start_service() {
+  stop_service >/dev/null 2>&1 || true
 
   cd "$ROOT_DIR"
+  ensure_runtime_env
   ensure_provider_env
+  ensure_build_ready
 
-  local log_file
-  log_file="$LOG_DIR/$mode-$(date +%Y%m%d-%H%M%S).log"
-
-  if [[ "$mode" == "dev" ]]; then
-    nohup env WEBUI_PASSWORD="$DEFAULT_PASSWORD" WEBUI_WORKSPACE="${WEBUI_WORKSPACE:-}" PORT="${PORT:-3001}" CODEX_BIN="${CODEX_BIN:-}" npm_config_cache="$ROOT_DIR/.npm-cache" npm run dev \
-      >"$log_file" 2>&1 &
-  else
-    nohup env WEBUI_PASSWORD="$DEFAULT_PASSWORD" WEBUI_WORKSPACE="${WEBUI_WORKSPACE:-}" PORT="${PORT:-3001}" CODEX_BIN="${CODEX_BIN:-}" npm start \
-      >"$log_file" 2>&1 &
-  fi
+  local log_file="$LOG_DIR/prod-$(date +%Y%m%d-%H%M%S).log"
+  nohup env \
+    WEBUI_PASSWORD="$PASSWORD_VALUE" \
+    WEBUI_WORKSPACE="${WEBUI_WORKSPACE:-}" \
+    PORT="$PORT_VALUE" \
+    CODEX_BIN="${CODEX_BIN:-}" \
+    "$NPM_BIN_VALUE" start >"$log_file" 2>&1 &
 
   local pid=$!
-  echo "$pid" >"$pid_file"
-
+  echo "$pid" > "$PID_FILE"
   sleep 2
 
-  if kill -0 "$pid" >/dev/null 2>&1; then
-    local -a expected_ports
-    case "$mode" in
-      dev) expected_ports=("${DEV_PORTS[@]}") ;;
-      prod) expected_ports=("${PROD_PORTS[@]}") ;;
-      *) expected_ports=() ;;
-    esac
-
-    for expected_port in "${expected_ports[@]}"; do
-      if ! lsof -tiTCP:"$expected_port" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
-        echo "Service failed to bind port $expected_port. See log: $log_file" >&2
-        stop_mode "$mode" >/dev/null 2>&1 || true
-        exit 1
-      fi
-    done
-
-    echo "Started $mode service."
-    echo "PID: $pid"
-    echo "Log: $log_file"
-    if [[ "$mode" == "dev" ]]; then
-      echo "Open: http://localhost:3001"
-    else
-      echo "Open: http://localhost:3001"
-    fi
-  else
-    echo "Failed to start $mode service. See log: $log_file" >&2
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    echo "Failed to start production service. See log: $log_file" >&2
     exit 1
   fi
+
+  if ! lsof -tiTCP:"$PORT_VALUE" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
+    echo "Service failed to bind port $PORT_VALUE. See log: $log_file" >&2
+    stop_service >/dev/null 2>&1 || true
+    exit 1
+  fi
+
+  echo "Started production service."
+  echo "PID: $pid"
+  echo "Log: $log_file"
+  echo "Open: http://localhost:$PORT_VALUE"
 }
 
-status_mode() {
-  for mode in dev prod; do
-    local pid_file
-    pid_file="$(pid_file_for_mode "$mode")"
-    if [[ -f "$pid_file" ]]; then
-      local pid
-      pid="$(cat "$pid_file")"
-      if kill -0 "$pid" >/dev/null 2>&1; then
-        echo "$mode: running (pid $pid)"
-      else
-        echo "$mode: stale pid file ($pid)"
-        cleanup_pid_file "$pid_file"
-      fi
+status_service() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PID_FILE")"
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      echo "prod: running (pid $pid)"
     else
-      echo "$mode: not running"
+      echo "prod: stale pid file ($pid)"
+      cleanup_pid_file
     fi
-  done
+  else
+    echo "prod: not running"
+  fi
 
-  for port in "${DEV_PORTS[@]}"; do
-    local pids
-    pids=$(lsof -tiTCP:"$port" -sTCP:LISTEN -n -P 2>/dev/null || true)
-    if [[ -n "$pids" ]]; then
-      echo "port $port: listening by $(echo "$pids" | tr '\n' ' ' | xargs)"
-    else
-      echo "port $port: free"
-    fi
-  done
+  local pids
+  pids=$(lsof -tiTCP:"$PORT_VALUE" -sTCP:LISTEN -n -P 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    echo "port $PORT_VALUE: listening by $(echo "$pids" | tr '\n' ' ' | xargs)"
+  else
+    echo "port $PORT_VALUE: free"
+  fi
 }
 
 COMMAND="${1:-status}"
 
-default_mode_for_command() {
-  case "${1:-status}" in
-    start|restart) echo "dev" ;;
-    stop) echo "all" ;;
-    status) echo "" ;;
-    *) echo "dev" ;;
-  esac
-}
-
-MODE="${2:-$(default_mode_for_command "$COMMAND")}"
-
 case "$COMMAND" in
-  start) start_mode "$MODE" ;;
-  stop) stop_mode "${MODE:-all}" ;;
+  run) run_foreground ;;
+  start) start_service ;;
+  stop) stop_service ;;
   restart)
-    stop_mode "$MODE"
-    start_mode "$MODE"
+    stop_service
+    start_service
     ;;
-  status) status_mode ;;
-  *) usage ;;
+  status) status_service ;;
+  *)
+    usage
+    exit 1
+    ;;
 esac
