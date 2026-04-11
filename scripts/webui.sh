@@ -126,7 +126,7 @@ run_foreground() {
   ensure_runtime_env
   ensure_provider_env
   ensure_build_ready
-  exec env \
+  exec env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR \
     WEBUI_PASSWORD="$PASSWORD_VALUE" \
     WEBUI_WORKSPACE="${WEBUI_WORKSPACE:-}" \
     PORT="$PORT_VALUE" \
@@ -143,7 +143,7 @@ start_service() {
   ensure_build_ready
 
   local log_file="$LOG_DIR/prod-$(date +%Y%m%d-%H%M%S).log"
-  nohup env \
+  nohup env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR \
     WEBUI_PASSWORD="$PASSWORD_VALUE" \
     WEBUI_WORKSPACE="${WEBUI_WORKSPACE:-}" \
     PORT="$PORT_VALUE" \

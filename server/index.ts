@@ -328,7 +328,10 @@ function listDirectories(targetPath?: string) {
 }
 
 function buildCodexChildEnv() {
-  const filteredEntries = Object.entries(process.env).filter(([key]) => !key.startsWith("CODEX_"));
+  const filteredEntries = Object.entries(process.env).filter(
+    ([key]) =>
+      !key.startsWith("CODEX_") && key !== "TMUX" && key !== "TMUX_PANE" && key !== "TMUX_TMPDIR",
+  );
   const env = Object.fromEntries(filteredEntries) as NodeJS.ProcessEnv;
   const pathEntries = String(env.PATH ?? "")
     .split(path.delimiter)
@@ -340,7 +343,6 @@ function buildCodexChildEnv() {
     PATH: pathEntries.join(path.delimiter),
     TERM: "xterm-256color",
     COLORTERM: "truecolor",
-    TMUX: "",
   };
 }
 
@@ -368,7 +370,7 @@ function runCommand(command: string, args: string[], env?: NodeJS.ProcessEnv) {
 }
 
 function runTmux(args: string[], options?: { allowFailure?: boolean; env?: NodeJS.ProcessEnv }) {
-  const result = runCommand("tmux", args, options?.env);
+  const result = runCommand("tmux", args, options?.env ?? buildCodexChildEnv());
   const stderr = result.stderr?.trim() ?? "";
 
   if (result.error) {
@@ -467,7 +469,7 @@ function listCodexSessions(): CodexSessionSummary[] {
     "#{session_attached}",
   ].join("\t");
 
-  const result = runCommand("tmux", ["list-sessions", "-F", format]);
+  const result = runCommand("tmux", ["list-sessions", "-F", format], buildCodexChildEnv());
   const stderr = result.stderr?.trim() ?? "";
 
   if (result.error) {
