@@ -42,6 +42,9 @@ Environment:
   WEBUI_WORKSPACE  Default workspace path shown in the UI
   PORT             HTTP port to bind. Default: 3001
   CODEX_BIN        Explicit path to the codex executable
+  OPENCODE_BIN     Explicit path to the OpenCode executable
+  COPILOT_BIN      Explicit path to the GitHub Copilot CLI executable
+  CLAUDE_BIN       Explicit path to the Claude Code executable
   WEBUI_ENV_FILE   Optional alternate env file path for local secrets
 EOF
 }
@@ -131,6 +134,9 @@ run_foreground() {
     WEBUI_WORKSPACE="${WEBUI_WORKSPACE:-}" \
     PORT="$PORT_VALUE" \
     CODEX_BIN="${CODEX_BIN:-}" \
+    OPENCODE_BIN="${OPENCODE_BIN:-}" \
+    COPILOT_BIN="${COPILOT_BIN:-}" \
+    CLAUDE_BIN="${CLAUDE_BIN:-}" \
     "$NPM_BIN_VALUE" start
 }
 
@@ -148,6 +154,9 @@ start_service() {
     WEBUI_WORKSPACE="${WEBUI_WORKSPACE:-}" \
     PORT="$PORT_VALUE" \
     CODEX_BIN="${CODEX_BIN:-}" \
+    OPENCODE_BIN="${OPENCODE_BIN:-}" \
+    COPILOT_BIN="${COPILOT_BIN:-}" \
+    CLAUDE_BIN="${CLAUDE_BIN:-}" \
     "$NPM_BIN_VALUE" start >"$log_file" 2>&1 &
 
   local pid=$!

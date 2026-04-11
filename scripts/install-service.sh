@@ -31,6 +31,9 @@ Environment:
   WEBUI_WORKSPACE  Default workspace path written to the service env file if unset
   PORT             HTTP port written to the service env file if unset. Default: 3001
   CODEX_BIN        Explicit codex path written to the service env file if unset
+  OPENCODE_BIN     Explicit OpenCode path written to the service env file if unset
+  COPILOT_BIN      Explicit GitHub Copilot CLI path written to the service env file if unset
+  CLAUDE_BIN       Explicit Claude Code path written to the service env file if unset
   NPM_BIN          Explicit npm path written to the service env file if unset
 EOF
 }
@@ -199,6 +202,9 @@ ensure_env_file() {
   mkdir -p "$ENV_DIR"
 
   local resolved_codex_bin="${CODEX_BIN:-}"
+  local resolved_opencode_bin="${OPENCODE_BIN:-}"
+  local resolved_copilot_bin="${COPILOT_BIN:-}"
+  local resolved_claude_bin="${CLAUDE_BIN:-}"
   local resolved_npm_bin="${NPM_BIN:-}"
   local provider
   local provider_env_key
@@ -211,6 +217,18 @@ ensure_env_file() {
 
   if [[ -z "$resolved_npm_bin" ]]; then
     resolved_npm_bin="$(command -v npm || true)"
+  fi
+
+  if [[ -z "$resolved_opencode_bin" ]]; then
+    resolved_opencode_bin="$(command -v opencode || true)"
+  fi
+
+  if [[ -z "$resolved_copilot_bin" ]]; then
+    resolved_copilot_bin="$(command -v copilot || command -v github-copilot-cli || true)"
+  fi
+
+  if [[ -z "$resolved_claude_bin" ]]; then
+    resolved_claude_bin="$(command -v claude || true)"
   fi
 
   provider="$(detect_model_provider)"
@@ -227,6 +245,9 @@ ensure_env_file() {
   upsert_env_line "WEBUI_WORKSPACE" "${WEBUI_WORKSPACE:-$ROOT_DIR}"
   upsert_env_line "PORT" "${PORT:-3001}"
   upsert_env_line "CODEX_BIN" "$resolved_codex_bin"
+  upsert_env_line "OPENCODE_BIN" "$resolved_opencode_bin"
+  upsert_env_line "COPILOT_BIN" "$resolved_copilot_bin"
+  upsert_env_line "CLAUDE_BIN" "$resolved_claude_bin"
   upsert_env_line "NPM_BIN" "$resolved_npm_bin"
   upsert_env_line "$provider_env_key" "$provider_env_value"
 

@@ -1,10 +1,11 @@
 # Codex Web UI
 
-Codex Web UI is a production-focused web wrapper around the local codex CLI. It runs each Codex session inside tmux, supports multiple concurrent sessions, and is tuned for both desktop and phone usage.
+Codex Web UI is a production-focused web wrapper around terminal AI CLIs. It can launch Codex CLI, OpenCode, GitHub Copilot CLI, or Claude Code inside tmux sessions, supports multiple concurrent sessions, and is tuned for both desktop and phone usage.
 
 ## Features
 
-- Multiple Codex sessions in one UI
+- Multiple AI CLI sessions in one UI
+- Session type picker for Codex CLI, OpenCode, GitHub Copilot CLI, and Claude Code
 - tmux-backed session persistence across service restarts
 - Browser reattach to existing tmux sessions
 - Working-directory picker before launch
@@ -17,7 +18,7 @@ Codex Web UI is a production-focused web wrapper around the local codex CLI. It 
 - Node.js 20+
 - npm
 - tmux 3.x+
-- A local codex binary on PATH, or CODEX_BIN=/absolute/path/to/codex
+- At least one supported CLI on PATH, or an explicit CODEX_BIN, OPENCODE_BIN, COPILOT_BIN, or CLAUDE_BIN
 
 ## Scope
 
@@ -36,8 +37,8 @@ The deployed stack is intentionally simple:
 - Vite builds the React frontend into dist
 - TypeScript builds the Node server into dist-server
 - The Node server serves the frontend and exposes REST plus WebSocket endpoints
-- Browser terminals attach over WebSocket to a tmux-backed Codex session
-- Each Codex session runs inside tmux, so service restarts do not kill active work
+- Browser terminals attach over WebSocket to a tmux-backed CLI session
+- Each managed session runs inside tmux, so service restarts do not kill active work
 - A user systemd service starts scripts/webui.sh run on boot
 - Secrets live only in ~/.config/codex-webui/codex-webui.env, outside the repository
 
@@ -175,6 +176,9 @@ WEBUI_PASSWORD=change-me
 WEBUI_WORKSPACE=/home/you/workspace
 PORT=3001
 CODEX_BIN=/home/linuxbrew/.linuxbrew/bin/codex
+OPENCODE_BIN=/home/you/.local/bin/opencode
+COPILOT_BIN=/home/you/bin/copilot
+CLAUDE_BIN=/home/you/bin/claude
 LITELLM_API_KEY=your_key_here
 ```
 
@@ -210,22 +214,26 @@ Supported flags:
 - --password: login password for the UI
 - --workspace: default workspace shown when the UI opens
 - --codex-bin: explicit path to the codex binary
+- --opencode-bin: explicit path to the OpenCode binary
+- --copilot-bin: explicit path to the GitHub Copilot CLI binary
+- --claude-bin: explicit path to the Claude Code binary
 
 ## Multi-session Workflow
 
 1. Log in to the web UI.
-2. Choose a working directory and optional session label.
+2. Choose a session type, working directory, and optional session label.
 3. Click Open session.
 4. Switch between running sessions without losing terminal state.
 5. Restart the web service if needed; tmux-backed sessions will be rediscovered.
 
-Each app-created session is stored in tmux and tracked by session label, workspace, and tmux session name.
+Each app-created session is stored in tmux and tracked by session type, session label, workspace, and tmux session name.
 
 ## Notes
 
-- The app starts Codex inside tmux using codex --no-alt-screen -C <workspace>
+- The app can start Codex CLI, OpenCode, GitHub Copilot CLI, or Claude Code inside tmux
 - Browser terminals attach to the selected tmux session and use node-pty first, with the bundled Python bridge as fallback
 - Existing tmux sessions created by the app are rediscovered through tmux metadata after service restart
 - Set CODEX_BIN if codex is not on PATH
+- Set OPENCODE_BIN, COPILOT_BIN, or CLAUDE_BIN if those CLIs are not on PATH
 - Set WEBUI_WORKSPACE to preload a default working directory
 - Do not commit your local ~/.config/codex-webui/codex-webui.env file or any copied secrets into the repository

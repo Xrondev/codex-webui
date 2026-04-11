@@ -95,7 +95,8 @@ code {
   font-size: 0.94rem;
 }
 
-.field input {
+.field input,
+.field select {
   width: 100%;
   border: 1px solid rgba(180, 231, 221, 0.18);
   background: rgba(6, 19, 23, 0.86);
@@ -105,7 +106,8 @@ code {
   outline: none;
 }
 
-.field input:focus {
+.field input:focus,
+.field select:focus {
   border-color: rgba(255, 180, 71, 0.78);
   box-shadow: 0 0 0 3px rgba(255, 180, 71, 0.16);
 }
@@ -1185,6 +1187,7 @@ code {
   }
 
   .field input,
+  .field select,
   .primary-button,
   .ghost-button {
     padding-top: 9px;
@@ -1195,7 +1198,8 @@ code {
     font-size: 0.88rem;
   }
 
-  .field input {
+  .field input,
+  .field select {
     font-size: 0.94rem;
   }
 

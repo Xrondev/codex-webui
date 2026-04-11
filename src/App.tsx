@@ -2,6 +2,8 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
+type SessionType = "codex" | "opencode" | "copilot" | "claude";
+
 type DirectoryList = {
   current: string;
   parent: string | null;
@@ -34,6 +36,7 @@ type ProviderSummary = {
 type CodexSessionSummary = {
   id: string;
   label: string;
+  sessionType: SessionType;
   workspace: string;
   tmuxSession: string;
   running: boolean;
@@ -41,6 +44,14 @@ type CodexSessionSummary = {
   lastActivity: number;
   attachedClients: number;
   preview: string;
+};
+
+type SessionTypeOption = {
+  id: SessionType;
+  label: string;
+  command: string;
+  available: boolean;
+  envVar: string;
 };
 
 type AuthState = {
@@ -52,11 +63,13 @@ type AuthState = {
   provider?: ProviderSummary;
   tmuxAvailable?: boolean;
   tmuxError?: string;
+  sessionTypes?: SessionTypeOption[];
   sessions: CodexSessionSummary[];
 };
 
 type SessionLookup = {
   sessions: CodexSessionSummary[];
+  sessionTypes: SessionTypeOption[];
   tmuxAvailable: boolean;
   tmuxError?: string;
 };
@@ -82,6 +95,12 @@ const initialDirectory: DirectoryList = {
 const recentDirectoriesStorageKey = "codex-webui-recent-directories";
 const maxRecentDirectories = 6;
 const compactLayoutBreakpoint = 900;
+const fallbackSessionTypes: SessionTypeOption[] = [
+  { id: "codex", label: "Codex CLI", command: "codex", available: true, envVar: "CODEX_BIN" },
+  { id: "opencode", label: "OpenCode", command: "opencode", available: false, envVar: "OPENCODE_BIN" },
+  { id: "copilot", label: "GitHub Copilot CLI", command: "copilot", available: false, envVar: "COPILOT_BIN" },
+  { id: "claude", label: "Claude Code", command: "claude", available: false, envVar: "CLAUDE_BIN" },
+];
 
 function isHiddenDirectory(name: string) {
   return name.startsWith(".");
@@ -267,6 +286,10 @@ function formatCompactStatus(value: string) {
   }
 }
 
+function getSessionTypeLabel(options: SessionTypeOption[], sessionType: SessionType) {
+  return options.find((option) => option.id === sessionType)?.label ?? sessionType;
+}
+
 function normalizeDirectoryPath(value: string) {
   const trimmed = value.trim();
   if (!trimmed || trimmed === "/") {
@@ -353,6 +376,7 @@ function App() {
   const [password, setPassword] = useState("");
   const [draftWorkspace, setDraftWorkspace] = useState("");
   const [sessionLabel, setSessionLabel] = useState("");
+  const [sessionType, setSessionType] = useState<SessionType>("codex");
   const [directoryList, setDirectoryList] = useState<DirectoryList>(initialDirectory);
   const [loadingDirs, setLoadingDirs] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -385,6 +409,9 @@ function App() {
   const focusScrollTimerRef = useRef<number | null>(null);
 
   const sessions = auth?.sessions ?? [];
+  const sessionTypeOptions = auth?.sessionTypes?.length ? auth.sessionTypes : fallbackSessionTypes;
+  const selectedSessionTypeOption =
+    sessionTypeOptions.find((option) => option.id === sessionType) ?? sessionTypeOptions[0];
   const selectedSession = sessions.find((entry) => entry.id === selectedSessionId) ?? null;
   const sandboxRestricted = Boolean(auth?.sandboxRestricted);
   const tmuxUnavailable = auth?.tmuxAvailable === false;
@@ -422,6 +449,7 @@ function App() {
         ? "Pick"
         : "Idle";
   const terminalKeyboardMode = isCompactLayout && isMobileKeyboardVisible && mobileView === "terminal";
+  const sessionTypeUnavailable = selectedSessionTypeOption?.available === false;
 
   const renderTerminalTools = () => (
     <>
@@ -459,6 +487,12 @@ function App() {
         <div className="terminal-footer-item terminal-footer-item-wide">
           <span className="terminal-footer-label">tmux</span>
           <code>{selectedSession?.tmuxSession}</code>
+        </div>
+        <div className="terminal-footer-item">
+          <span className="terminal-footer-label">Type</span>
+          <span>
+            {selectedSession ? getSessionTypeLabel(sessionTypeOptions, selectedSession.sessionType) : "-"}
+          </span>
         </div>
         <div className="terminal-footer-item">
           <span className="terminal-footer-label">Transport</span>
@@ -570,6 +604,7 @@ function App() {
       current
         ? {
             ...current,
+            sessionTypes: payload.sessionTypes,
             tmuxAvailable: payload.tmuxAvailable,
             tmuxError: payload.tmuxError,
             sessions: sortSessions(payload.sessions),
@@ -725,6 +760,20 @@ function App() {
       setTerminalReady(false);
     };
   }, [auth?.authenticated, selectedSessionId]);
+
+  useEffect(() => {
+    if (!sessionTypeOptions.some((option) => option.id === sessionType)) {
+      setSessionType(sessionTypeOptions[0]?.id ?? "codex");
+      return;
+    }
+
+    if (selectedSessionTypeOption?.available === false) {
+      const nextAvailable = sessionTypeOptions.find((option) => option.available);
+      if (nextAvailable && nextAvailable.id !== sessionType) {
+        setSessionType(nextAvailable.id);
+      }
+    }
+  }, [selectedSessionTypeOption?.available, sessionType, sessionTypeOptions]);
 
   useEffect(() => {
     const terminal = terminalInstanceRef.current;
@@ -1048,6 +1097,7 @@ function App() {
         body: JSON.stringify({
           workspace: resolvedWorkspace,
           label: sessionLabel.trim(),
+          sessionType,
         }),
       });
       await loadSessions(response.session.id);
@@ -1058,7 +1108,7 @@ function App() {
       setSessionError(null);
       setMobileView("terminal");
     } catch (error) {
-      setSessionError(error instanceof Error ? error.message : "Unable to create Codex session");
+      setSessionError(error instanceof Error ? error.message : "Unable to create session");
     } finally {
       setIsBusy(false);
     }
@@ -1142,11 +1192,11 @@ function App() {
     return (
       <main className="shell shell-login">
         <section className="panel login-panel">
-          <div className="eyebrow">Codex Session Deck</div>
-          <h1>Log in and manage multiple Codex terminals from one place.</h1>
+          <div className="eyebrow">Session Deck</div>
+          <h1>Log in and manage multiple AI CLI terminals from one place.</h1>
           <p className="panel-copy">
-            This UI launches Codex inside tmux sessions, so you can reopen the page or restart the
-            service and still recover the live session list.
+            This UI launches supported AI CLIs inside tmux sessions, so you can reopen the page or
+            restart the service and still recover the live session list.
           </p>
           <form className="stack" onSubmit={handleLogin}>
             <label className="field">
@@ -1176,7 +1226,7 @@ function App() {
         <div className={`control-dock-main${isCompactLayout ? " compact" : ""}`}>
           {!isCompactLayout ? (
             <div className="control-dock-title">
-              <div className="eyebrow">Codex Fleet</div>
+              <div className="eyebrow">Session Fleet</div>
               <strong>{selectedSession ? selectedSession.label : `${sessions.length} live sessions`}</strong>
               <div className="topbar-subtle control-dock-subtle">
                 {selectedSession?.workspace || resolvedWorkspace || auth.homeDir || "No target selected"}
@@ -1200,7 +1250,7 @@ function App() {
               <option value="">No active session</option>
               {sessions.map((session) => (
                 <option key={session.id} value={session.id}>
-                  {session.label} · {session.workspace}
+                  {getSessionTypeLabel(sessionTypeOptions, session.sessionType)} · {session.label} · {session.workspace}
                 </option>
               ))}
             </select>
@@ -1237,6 +1287,12 @@ function App() {
               <span className="meta-label">tmux</span>
               <strong>{tmuxUnavailable ? "Unavailable" : "Ready"}</strong>
             </div>
+            {selectedSession ? (
+              <div className="control-chip">
+                <span className="meta-label">Type</span>
+                <strong>{getSessionTypeLabel(sessionTypeOptions, selectedSession.sessionType)}</strong>
+              </div>
+            ) : null}
             {showTargetMeta ? (
               <div className="control-chip control-chip-wide">
                 <span className="meta-label">Next launch target</span>
@@ -1292,7 +1348,7 @@ function App() {
                 <div className="panel-header compact-panel-header">
                   <div>
                     <div className="eyebrow">Launcher</div>
-                    <h2>Start another Codex session</h2>
+                    <h2>Start another CLI session</h2>
                   </div>
                   <button
                     className="ghost-button"
@@ -1313,6 +1369,24 @@ function App() {
                   <div className="launcher-match-row">
                     <span className="launcher-match-label">Directory matches</span>
                     <code>{launcherMatchPath}</code>
+                  </div>
+                ) : null}
+
+                <label className="field">
+                  <span>Session type</span>
+                  <select value={sessionType} onChange={(event) => setSessionType(event.target.value as SessionType)}>
+                    {sessionTypeOptions.map((option) => (
+                      <option disabled={!option.available} key={option.id} value={option.id}>
+                        {option.label}
+                        {!option.available ? " (not found)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                {sessionTypeUnavailable ? (
+                  <div className="error-banner">
+                    {selectedSessionTypeOption.label} is not available on this server. Set {selectedSessionTypeOption.envVar} and restart the service.
                   </div>
                 ) : null}
 
@@ -1385,7 +1459,7 @@ function App() {
                 <div className="action-row">
                   <button
                     className="primary-button"
-                    disabled={isBusy || !resolvedWorkspace || sandboxRestricted || tmuxUnavailable}
+                    disabled={isBusy || !resolvedWorkspace || sandboxRestricted || tmuxUnavailable || sessionTypeUnavailable}
                     onClick={() => void handleCreateSession()}
                     type="button"
                   >
@@ -1552,7 +1626,7 @@ function App() {
                 </div>
               </div>
 
-              <div className="hint mobile-hint">The launcher uses tmux sessions, so service restarts can rediscover existing Codex terminals.</div>
+              <div className="hint mobile-hint">The launcher uses tmux sessions, so service restarts can rediscover existing supported CLI terminals.</div>
             </div>
           </details>
 
@@ -1565,7 +1639,9 @@ function App() {
                 <div className="terminal-heading">
                   <div className="eyebrow">Active Session</div>
                   <h2>{selectedSession.label}</h2>
-                  <div className="terminal-subtitle">{selectedSession.workspace}</div>
+                  <div className="terminal-subtitle">
+                    {getSessionTypeLabel(sessionTypeOptions, selectedSession.sessionType)} · {selectedSession.workspace}
+                  </div>
                   {isCompactLayout ? (
                     <div className="terminal-summary-line">
                       <span className={`status-dot terminal-status-badge ${liveStatus === "Connected" ? "connected" : ""}`}>
@@ -1601,6 +1677,7 @@ function App() {
 
               {!isCompactLayout ? (
                 <div className="terminal-chip-row">
+                  <div className="terminal-chip">type: {getSessionTypeLabel(sessionTypeOptions, selectedSession.sessionType)}</div>
                   <div className="terminal-chip">tmux: {selectedSession.tmuxSession}</div>
                   <div className="terminal-chip">started: {formatTime(selectedSession.createdAt)}</div>
                   <div className="terminal-chip">attached: {selectedSession.attachedClients}</div>

@@ -16,9 +16,12 @@ type ClientMessage =
   | { type: "resize"; cols: number; rows: number }
   | { type: "ping" };
 
+type SessionType = "codex" | "opencode" | "copilot" | "claude";
+
 type CodexSessionSummary = {
   id: string;
   label: string;
+  sessionType: SessionType;
   workspace: string;
   tmuxSession: string;
   running: boolean;
@@ -44,9 +47,20 @@ type ProviderConfigSummary = {
 
 type RuntimeConfig = {
   codexBin?: string;
+  opencodeBin?: string;
+  copilotBin?: string;
+  claudeBin?: string;
   defaultPassword: string;
   defaultWorkspace: string;
   port: number;
+};
+
+type SessionTypeOption = {
+  id: SessionType;
+  label: string;
+  command: string;
+  available: boolean;
+  envVar: string;
 };
 
 type AuthSession = {
@@ -62,6 +76,7 @@ type TerminalBridge = {
 
 type SessionLookup = {
   sessions: CodexSessionSummary[];
+  sessionTypes: SessionTypeOption[];
   tmuxAvailable: boolean;
   tmuxError?: string;
 };
@@ -101,6 +116,9 @@ function parseRuntimeConfig(argv: string[]): RuntimeConfig {
   let parsedPassword: string | undefined;
   let parsedWorkspace: string | undefined;
   let parsedCodexBin: string | undefined;
+  let parsedOpencodeBin: string | undefined;
+  let parsedCopilotBin: string | undefined;
+  let parsedClaudeBin: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -146,6 +164,39 @@ function parseRuntimeConfig(argv: string[]): RuntimeConfig {
       if (!arg.includes("=") && value) {
         index += 1;
       }
+      continue;
+    }
+
+    if (arg.startsWith("--opencode-bin")) {
+      const value = readArgValue(argv, index);
+      if (value) {
+        parsedOpencodeBin = value;
+      }
+      if (!arg.includes("=") && value) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (arg.startsWith("--copilot-bin")) {
+      const value = readArgValue(argv, index);
+      if (value) {
+        parsedCopilotBin = value;
+      }
+      if (!arg.includes("=") && value) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (arg.startsWith("--claude-bin")) {
+      const value = readArgValue(argv, index);
+      if (value) {
+        parsedClaudeBin = value;
+      }
+      if (!arg.includes("=") && value) {
+        index += 1;
+      }
     }
   }
 
@@ -161,6 +212,9 @@ function parseRuntimeConfig(argv: string[]): RuntimeConfig {
 
   return {
     codexBin: parsedCodexBin ?? process.env.CODEX_BIN,
+    opencodeBin: parsedOpencodeBin ?? process.env.OPENCODE_BIN,
+    copilotBin: parsedCopilotBin ?? process.env.COPILOT_BIN,
+    claudeBin: parsedClaudeBin ?? process.env.CLAUDE_BIN,
     defaultPassword: parsedPassword ?? process.env.WEBUI_PASSWORD ?? "codex-webui",
     defaultWorkspace,
     port,
@@ -180,26 +234,6 @@ const isDevelopment = process.env.NODE_ENV !== "production";
 
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
-
-function resolveCodexCommand(explicit?: string) {
-  if (explicit) {
-    return explicit;
-  }
-
-  const candidates = [
-    ...String(process.env.PATH ?? "")
-      .split(path.delimiter)
-      .filter(Boolean)
-      .map((segment) => path.join(segment, "codex")),
-    "/opt/homebrew/bin/codex",
-    "/usr/local/bin/codex",
-  ];
-
-  const match = candidates.find((candidate) => fs.existsSync(candidate));
-  return match ?? "codex";
-}
-
-const codexCommand = resolveCodexCommand(runtimeConfig.codexBin);
 
 function readProviderSummary(): ProviderConfigSummary {
   let text = "";
@@ -362,6 +396,136 @@ function shellEscape(value: string) {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+function findExecutable(candidate: string) {
+  if (!candidate) {
+    return "";
+  }
+
+  if (candidate.includes("/")) {
+    return fs.existsSync(candidate) ? candidate : "";
+  }
+
+  const pathEntries = String(process.env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  const match = pathEntries
+    .map((segment) => path.join(segment, candidate))
+    .find((entry) => fs.existsSync(entry));
+
+  return match ?? "";
+}
+
+function resolveCliCommand(explicit: string | undefined, candidateNames: string[], fallbackPaths: string[] = []) {
+  if (explicit) {
+    return {
+      command: explicit,
+      available: Boolean(findExecutable(explicit)),
+    };
+  }
+
+  for (const candidate of candidateNames) {
+    const match = findExecutable(candidate);
+    if (match) {
+      return {
+        command: match,
+        available: true,
+      };
+    }
+  }
+
+  for (const candidate of fallbackPaths) {
+    const match = findExecutable(candidate);
+    if (match) {
+      return {
+        command: match,
+        available: true,
+      };
+    }
+  }
+
+  return {
+    command: explicit ?? candidateNames[0],
+    available: false,
+  };
+}
+
+function normalizeSessionType(input: string): SessionType {
+  switch (input) {
+    case "codex":
+    case "opencode":
+    case "copilot":
+    case "claude":
+      return input;
+    default:
+      return "codex";
+  }
+}
+
+const codexCli = resolveCliCommand(runtimeConfig.codexBin, ["codex"], [
+  "/opt/homebrew/bin/codex",
+  "/usr/local/bin/codex",
+]);
+const opencodeCli = resolveCliCommand(runtimeConfig.opencodeBin, ["opencode"]);
+const copilotCli = resolveCliCommand(runtimeConfig.copilotBin, ["copilot", "github-copilot-cli"]);
+const claudeCli = resolveCliCommand(runtimeConfig.claudeBin, ["claude"]);
+
+const sessionTypeOptions: SessionTypeOption[] = [
+  {
+    id: "codex",
+    label: "Codex CLI",
+    command: codexCli.command,
+    available: codexCli.available,
+    envVar: "CODEX_BIN",
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    command: opencodeCli.command,
+    available: opencodeCli.available,
+    envVar: "OPENCODE_BIN",
+  },
+  {
+    id: "copilot",
+    label: "GitHub Copilot CLI",
+    command: copilotCli.command,
+    available: copilotCli.available,
+    envVar: "COPILOT_BIN",
+  },
+  {
+    id: "claude",
+    label: "Claude Code",
+    command: claudeCli.command,
+    available: claudeCli.available,
+    envVar: "CLAUDE_BIN",
+  },
+];
+
+function getSessionTypeOption(sessionType: SessionType) {
+  return sessionTypeOptions.find((option) => option.id === sessionType) ?? sessionTypeOptions[0];
+}
+
+function buildSessionLaunchCommand(sessionType: SessionType, workspace: string) {
+  switch (sessionType) {
+    case "codex":
+      return `${shellEscape(codexCli.command)} --no-alt-screen -C ${shellEscape(workspace)}`;
+    case "opencode":
+      return shellEscape(opencodeCli.command);
+    case "copilot":
+      return shellEscape(copilotCli.command);
+    case "claude":
+      return shellEscape(claudeCli.command);
+  }
+}
+
+function assertSessionTypeAvailable(sessionType: SessionType) {
+  const option = getSessionTypeOption(sessionType);
+  if (option.available) {
+    return;
+  }
+
+  throw new Error(`${option.label} was not found on PATH. Set ${option.envVar}=/absolute/path/to/the-cli and restart the service.`);
+}
+
 function runCommand(command: string, args: string[], env?: NodeJS.ProcessEnv) {
   return spawnSync(command, args, {
     encoding: "utf8",
@@ -433,19 +597,24 @@ function parseCodexSessionLine(line: string): CodexSessionSummary | null {
     return null;
   }
 
-  const [tmuxSession, managedFlag, sessionId, labelValue, storedWorkspace, fallbackWorkspace, createdAt, lastActivity, attachedClients] = parts;
+  const values = parts.length >= 10
+    ? parts
+    : [parts[0], parts[1], parts[2], "codex", parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]];
+  const [tmuxSession, managedFlag, sessionId, sessionTypeValue, labelValue, storedWorkspace, fallbackWorkspace, createdAt, lastActivity, attachedClients] = values;
   const managed = managedFlag === "1" || tmuxSession.startsWith(`${tmuxSessionPrefix}-`);
 
   if (!managed || !sessionId) {
     return null;
   }
 
+  const sessionType = normalizeSessionType(sessionTypeValue || "codex");
   const workspace = storedWorkspace || fallbackWorkspace || defaultWorkspace;
   const label = labelValue || path.basename(workspace) || tmuxSession;
 
   return {
     id: sessionId,
     label,
+    sessionType,
     workspace,
     tmuxSession,
     running: true,
@@ -461,6 +630,7 @@ function listCodexSessions(): CodexSessionSummary[] {
     "#{session_name}",
     `#{${tmuxMetadataPrefix}_managed}`,
     `#{${tmuxMetadataPrefix}_id}`,
+    `#{${tmuxMetadataPrefix}_type}`,
     `#{${tmuxMetadataPrefix}_label}`,
     `#{${tmuxMetadataPrefix}_workspace}`,
     "#{pane_current_path}",
@@ -500,11 +670,13 @@ function getSessionLookup(): SessionLookup {
   try {
     return {
       sessions: listCodexSessions(),
+      sessionTypes: sessionTypeOptions,
       tmuxAvailable: true,
     };
   } catch (error) {
     return {
       sessions: [],
+      sessionTypes: sessionTypeOptions,
       tmuxAvailable: false,
       tmuxError: error instanceof Error ? error.message : "Unable to query tmux sessions",
     };
@@ -515,42 +687,48 @@ function findCodexSession(sessionId: string) {
   return listCodexSessions().find((session) => session.id === sessionId) ?? null;
 }
 
-function buildTmuxSessionName(sessionId: string, label: string, workspace: string) {
+function buildTmuxSessionName(sessionId: string, sessionType: SessionType, label: string, workspace: string) {
   const baseName = slugify(label || path.basename(workspace) || "session") || "session";
-  return `${tmuxSessionPrefix}-${baseName}-${sessionId.slice(0, 8)}`;
+  return `${tmuxSessionPrefix}-${sessionType}-${baseName}-${sessionId.slice(0, 8)}`;
 }
 
-function setManagedTmuxOptions(tmuxSession: string, sessionId: string, label: string, workspace: string) {
+function setManagedTmuxOptions(
+  tmuxSession: string,
+  sessionId: string,
+  sessionType: SessionType,
+  label: string,
+  workspace: string,
+) {
   runTmux(["set-option", "-t", tmuxSession, "-q", "status", "off"]);
   runTmux(["set-option", "-t", tmuxSession, "-q", "window-size", "latest"]);
   runTmux(["set-option", "-t", tmuxSession, "-q", "mouse", "on"]);
   runTmux(["set-option", "-t", tmuxSession, "-q", "history-limit", "50000"]);
   runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_managed`, "1"]);
   runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_id`, sessionId]);
+  runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_type`, sessionType]);
   runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_label`, label]);
   runTmux(["set-option", "-t", tmuxSession, "-q", `${tmuxMetadataPrefix}_workspace`, workspace]);
 }
 
-function buildCodexLaunchCommand(workspace: string) {
-  return `${shellEscape(codexCommand)} --no-alt-screen -C ${shellEscape(workspace)}`;
-}
-
-function createCodexSession(workspaceInput: string, labelInput: string) {
+function createCodexSession(workspaceInput: string, labelInput: string, sessionTypeInput: string) {
   if (sandboxRestricted) {
     throw new Error(restrictionMessage);
   }
 
+  const sessionType = normalizeSessionType(sessionTypeInput);
+  assertSessionTypeAvailable(sessionType);
   const workspace = normalizeDirectory(workspaceInput);
   const stat = fs.statSync(workspace);
   if (!stat.isDirectory()) {
     throw new Error("Workspace is not a directory");
   }
 
-  const label = sanitizeSessionLabel(labelInput) || path.basename(workspace) || "Codex session";
+  const sessionTypeOption = getSessionTypeOption(sessionType);
+  const label = sanitizeSessionLabel(labelInput) || path.basename(workspace) || `${sessionTypeOption.label} session`;
   const sessionId = randomUUID();
-  const tmuxSession = buildTmuxSessionName(sessionId, label, workspace);
+  const tmuxSession = buildTmuxSessionName(sessionId, sessionType, label, workspace);
   const childEnv = buildCodexChildEnv();
-  const command = buildCodexLaunchCommand(workspace);
+  const command = buildSessionLaunchCommand(sessionType, workspace);
   const result = runCommand("tmux", ["new-session", "-d", "-s", tmuxSession, "-c", workspace, command], childEnv);
 
   if (result.error) {
@@ -565,7 +743,7 @@ function createCodexSession(workspaceInput: string, labelInput: string) {
     throw new Error(result.stderr?.trim() || "Unable to create tmux session");
   }
 
-  setManagedTmuxOptions(tmuxSession, sessionId, label, workspace);
+  setManagedTmuxOptions(tmuxSession, sessionId, sessionType, label, workspace);
   const session = findCodexSession(sessionId);
   if (!session) {
     throw new Error("Session started but could not be discovered in tmux");
@@ -711,7 +889,6 @@ app.get("/api/health", (_req, res) => {
   const lookup = getSessionLookup();
   res.json({
     ok: true,
-    codexCommand,
     defaultWorkspace,
     passwordConfigured: Boolean(defaultPassword),
     sandboxRestricted,
@@ -719,6 +896,7 @@ app.get("/api/health", (_req, res) => {
     provider,
     tmuxAvailable: lookup.tmuxAvailable,
     tmuxError: lookup.tmuxError,
+    sessionTypes: lookup.sessionTypes,
     sessions: lookup.sessions,
   });
 });
@@ -767,6 +945,7 @@ app.get("/api/auth/session", (req, res) => {
     provider,
     tmuxAvailable: lookup.tmuxAvailable,
     tmuxError: lookup.tmuxError,
+    sessionTypes: lookup.sessionTypes,
     sessions: lookup.sessions,
   });
 });
@@ -796,14 +975,15 @@ app.post("/api/codex/sessions", authRequired, (req, res) => {
     }
 
     const label = String(req.body?.label ?? "");
-    const session = createCodexSession(workspace, label);
+    const sessionType = String(req.body?.sessionType ?? "codex");
+    const session = createCodexSession(workspace, label, sessionType);
     res.json({
       ok: true,
       session,
     });
   } catch (error) {
     res.status(400).json({
-      error: error instanceof Error ? error.message : "Unable to create Codex session",
+      error: error instanceof Error ? error.message : "Unable to create session",
     });
   }
 });
